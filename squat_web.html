@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>深蹲姿態分析 Squat Analyzer</title>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,"Noto Sans TC",sans-serif;background:#111;color:#eee}
+  header{padding:10px 16px;background:#1b1b1b;font-weight:600}
+  main{display:flex;flex-wrap:wrap;gap:12px;padding:12px}
+  .stage{flex:2 1 520px;min-width:0}
+  .side{flex:1 1 280px;min-width:260px}
+  canvas{width:100%;background:#000;border-radius:8px;display:block}
+  video{display:none}
+  .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:8px 0}
+  button,select,input[type=number]{background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:7px 11px;font-size:14px}
+  button{cursor:pointer} button:hover:not(:disabled){background:#3a3a3a} button:disabled{opacity:.4;cursor:default}
+  button.pri{background:#2e7d32;border-color:#2e7d32}
+  .card{background:#1b1b1b;border-radius:8px;padding:12px;margin-bottom:12px}
+  .card h3{margin:0 0 8px;font-size:14px;color:#aaa;font-weight:600}
+  .big{font-size:28px;font-weight:700}
+  .row{display:flex;justify-content:space-between;gap:8px;margin:5px 0;font-size:14px;align-items:center}
+  .row input[type=number]{width:80px}
+  .ok{color:#6fd36f}.bad{color:#ff6b6b}.warn{color:#ffc83d}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  td,th{padding:3px 4px;text-align:right;border-bottom:1px solid #333} th{color:#aaa;font-weight:500}
+  #msg{min-height:22px;font-size:14px}
+</style>
+</head>
+<body>
+<header>深蹲姿態分析 Squat Analyzer（MediaPipe Pose，影像只在你的瀏覽器處理，不會上傳）</header>
+<main>
+  <div class="stage">
+    <canvas id="cv" width="960" height="540"></canvas>
+    <video id="vid" playsinline muted></video>
+    <div class="bar">
+      <button id="btnCam" class="pri" disabled>開啟鏡頭</button>
+      <button id="btnFile" disabled>匯入影片</button>
+      <input type="file" id="file" accept="video/*" hidden>
+      <button id="btnPlay" disabled>暫停</button>
+      <label>速度 <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>x</label>
+      <label><input type="checkbox" id="mirror"> 鏡像</label>
+    </div>
+    <div id="msg">正在載入模型…</div>
+  </div>
+  <div class="side">
+    <div class="card">
+      <h3>狀態</h3>
+      <div class="row"><span>次數</span><span class="big" id="reps">0</span></div>
+      <div class="row"><span>階段</span><b id="state">STAND</b></div>
+      <div class="row"><span>膝角 / 髖角 / 軀幹傾斜</span><span id="angles">-</span></div>
+      <div id="fb" class="warn">-</div>
+    </div>
+    <div class="card">
+      <h3>設定</h3>
+      <div class="row"><span>拍攝角度</span><select id="view"><option value="side">側面</option><option value="front">正面（偵測內夾）</option></select></div>
+      <div class="row"><span>追蹤側</span><select id="side"><option value="auto">自動</option><option value="left">左</option><option value="right">右</option></select></div>
+      <div class="row"><span>深度門檻：膝角 ≤ (°)</span><input type="number" id="depth" value="100"></div>
+      <div class="row"><span>軀幹傾斜上限 (°)</span><input type="number" id="lean" value="50"></div>
+      <div class="row"><span>內夾比例門檻</span><input type="number" id="valgus" value="0.85" step="0.05"></div>
+    </div>
+    <div class="card">
+      <h3>每下紀錄</h3>
+      <table><thead><tr><th>#</th><th>膝角</th><th>傾斜</th><th>下/上(s)</th><th>深</th><th>背</th><th>膝</th></tr></thead><tbody id="tb"></tbody></table>
+      <div class="bar"><button id="btnReset">重置</button><button id="btnCsv">下載 CSV</button></div>
+    </div>
+  </div>
+</main>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = id => document.getElementById(id);
+const cv = $("cv"), ctx = cv.getContext("2d"), vid = $("vid");
+const SH = {left:11,right:12}, HP = {left:23,right:24}, KN = {left:25,right:26}, AN = {left:27,right:28};
+
+// ---------- geometry ----------
+const angle3 = (a,b,c) => {
+  const ba=[a[0]-b[0],a[1]-b[1]], bc=[c[0]-b[0],c[1]-b[1]];
+  const d = Math.hypot(...ba)*Math.hypot(...bc)+1e-9;
+  return Math.acos(Math.max(-1,Math.min(1,(ba[0]*bc[0]+ba[1]*bc[1])/d)))*180/Math.PI;
+};
+const tilt = (top,bot) => Math.atan2(Math.abs(top[0]-bot[0]), -(top[1]-bot[1]))*180/Math.PI;
+class EMA { constructor(a){this.a=a;this.v=null}
+  u(x){ if(x==null) return this.v; this.v = this.v==null ? x : this.a*x+(1-this.a)*this.v; return this.v }
+  r(){ this.v=null } }
+
+// ---------- squat state machine ----------
+class Squat {
+  constructor(){ this.reset() }
+  reset(){ this.reps=[]; this.state="STAND"; this.base=new EMA(0.05); this.clr() }
+  clr(){ this.t0=null; this.tb=null; this.minK=999; this.maxT=0; this.minR=null }
+  update(t,k,tor,ratio,P){
+    if(k==null) return this.state;
+    if(this.state==="STAND"){
+      if(ratio!=null) this.base.u(ratio);
+      if(k<150){ this.clr(); this.state="DOWN"; this.t0=t; }
+    }
+    if(this.state!=="STAND"){
+      if(k<this.minK){ this.minK=k; this.tb=t; }
+      if(tor!=null) this.maxT=Math.max(this.maxT,tor);
+      if(ratio!=null && this.base.v){ const rel=ratio/this.base.v; this.minR = this.minR==null?rel:Math.min(this.minR,rel); }
+      if(this.state==="DOWN"){
+        if(k<=P.depth) this.state="BOTTOM";
+        else if(k>this.minK+12) this.state="UP";
+      } else if(this.state==="BOTTOM"){
+        if(k>this.minK+10) this.state="UP";
+      } else if(this.state==="UP"){
+        if(k>=160){ this.finish(t,P); this.state="STAND"; }
+      }
+      if((this.state==="DOWN"||this.state==="BOTTOM") && k>=160){ this.finish(t,P); this.state="STAND"; }
+    }
+    return this.state;
+  }
+  finish(tEnd,P){
+    if(this.minK>140 || this.t0==null) return;
+    const down=this.tb-this.t0, up=tEnd-this.tb;
+    this.reps.push({rep:this.reps.length+1, min_knee_deg:+this.minK.toFixed(1), max_torso_lean_deg:+this.maxT.toFixed(1),
+      down_time_s:+down.toFixed(2), up_time_s:+up.toFixed(2), tempo_down_up: up>0.01?+(down/up).toFixed(2):"",
+      min_knee_ankle_ratio: this.minR==null?"":+this.minR.toFixed(2),
+      depth_ok:this.minK<=P.depth, back_ok:this.maxT<=P.lean, valgus_ok:this.minR==null||this.minR>=P.valgus});
+    renderReps();
+  }
+}
+
+// ---------- app state ----------
+const sq = new Squat();
+const sm = {knee:new EMA(.4), hip:new EMA(.4), torso:new EMA(.4), ratio:new EMA(.4)};
+let side="right", lm=null, running=false, isCam=false, tStart=0, lastT=-1, log=[];
+const params = () => ({depth:+$("depth").value, lean:+$("lean").value, valgus:+$("valgus").value});
+
+// ---------- model ----------
+try {
+  const fs = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  lm = await PoseLandmarker.createFromOptions(fs, {
+    baseOptions:{ modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task", delegate:"GPU" },
+    runningMode:"VIDEO", numPoses:1 });
+  $("msg").textContent = "模型已載入。按「開啟鏡頭」或「匯入影片」。";
+  $("btnCam").disabled = $("btnFile").disabled = false;
+} catch(e) {
+  $("msg").innerHTML = `<span class="bad">模型載入失敗：${e.message}（請確認有網路，並用 http://localhost 或 https 開啟）</span>`;
+}
+
+// ---------- input ----------
+$("btnCam").onclick = async () => {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:{width:1280,height:720,facingMode:"user"},audio:false});
+    vid.srcObject = s; vid.removeAttribute("src"); isCam = true; vid.loop=false;
+    await vid.play(); begin();
+  } catch(e){ $("msg").innerHTML = `<span class="bad">無法開啟鏡頭：${e.message}</span>`; }
+};
+$("btnFile").onclick = () => $("file").click();
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if(!f) return;
+  if(vid.srcObject){ vid.srcObject.getTracks().forEach(t=>t.stop()); vid.srcObject=null; }
+  vid.src = URL.createObjectURL(f); isCam=false; vid.playbackRate=+$("speed").value;
+  await vid.play(); begin();
+};
+$("btnPlay").onclick = () => { if(isCam) return; if(vid.paused){vid.play();$("btnPlay").textContent="暫停"} else {vid.pause();$("btnPlay").textContent="播放"} };
+$("speed").onchange = () => { vid.playbackRate = +$("speed").value };
+$("btnReset").onclick = () => { sq.reset(); log=[]; renderReps(); $("reps").textContent=0; };
+$("btnCsv").onclick = downloadCsv;
+vid.onended = () => { $("msg").textContent = "影片結束，可下載 CSV。"; };
+
+function begin(){
+  sq.reset(); log=[]; renderReps(); Object.values(sm).forEach(x=>x.r());
+  cv.width = vid.videoWidth || 960; cv.height = vid.videoHeight || 540;
+  tStart = performance.now(); lastT=-1; $("btnPlay").disabled = isCam;
+  $("btnPlay").textContent="暫停"; $("msg").textContent = "分析中…";
+  if(!running){ running=true; requestAnimationFrame(loop); }
+}
+
+// ---------- main loop ----------
+function loop(){
+  requestAnimationFrame(loop);
+  if(vid.readyState<2) return;
+  const W=cv.width, H=cv.height, mir=$("mirror").checked;
+  ctx.save(); if(mir){ ctx.translate(W,0); ctx.scale(-1,1); }
+  ctx.drawImage(vid,0,0,W,H); ctx.restore();
+
+  const now = performance.now();
+  if(vid.currentTime===lastT && !isCam) { drawHud(null); return; }
+  lastT = vid.currentTime;
+  const t = isCam ? (now-tStart)/1000 : vid.currentTime;
+  let res; try { res = lm.detectForVideo(vid, now); } catch(e){ return; }
+  const L = res.landmarks && res.landmarks[0];
+  const P = params(); const view=$("view").value;
+  let info=null;
+  if(L){
+    const pt = i => [(mir?1-L[i].x:L[i].x)*W, L[i].y*H];
+    const vis = s => [SH,HP,KN,AN].reduce((a,m)=>a+(L[m[s]].visibility||0),0)/4;
+    const pick=$("side").value;
+    if(pick==="auto"){ const o=side==="right"?"left":"right"; if(vis(o)>vis(side)+0.15){ side=o; Object.values(sm).forEach(x=>x.r()); } }
+    else side=pick;
+    const s=pt(SH[side]), h=pt(HP[side]), k=pt(KN[side]), a=pt(AN[side]);
+    const knee=sm.knee.u(angle3(h,k,a)), hip=sm.hip.u(angle3(s,h,k)), tor=sm.torso.u(tilt(s,h));
+    let ratio=null;
+    if(view==="front"){ const aw=Math.abs(pt(AN.left)[0]-pt(AN.right)[0]);
+      if(aw>10) ratio=sm.ratio.u(Math.abs(pt(KN.left)[0]-pt(KN.right)[0])/aw); }
+    const st=sq.update(t,knee,tor,ratio,P);
+    const leanBad=tor>P.lean;
+    const valBad = ratio!=null && sq.base.v && ratio/sq.base.v<P.valgus && st!=="STAND";
+    const col = (leanBad||valBad) ? "#ff5252" : "#4caf50";
+    const msgs=[]; if(leanBad) msgs.push("背部前傾過多"); if(valBad) msgs.push("膝蓋內夾"); if(st==="BOTTOM"&&knee<=P.depth) msgs.push("深度足夠");
+    drawChain([s,h,k,a], col);
+    label(`膝 ${knee.toFixed(0)}°`, k[0]+10, k[1]); label(`髖 ${hip.toFixed(0)}°`, h[0]+10, h[1]);
+    label(`軀幹 ${tor.toFixed(0)}°`, s[0]+10, s[1], leanBad?"#ff5252":"#fff");
+    info={st,knee,hip,tor,ratio,msgs,col};
+    log.push({t_s:+t.toFixed(3), state:st, knee_deg:+knee.toFixed(1), hip_deg:+hip.toFixed(1), torso_lean_deg:+tor.toFixed(1), knee_ankle_ratio: ratio==null?"":+ratio.toFixed(3)});
+  }
+  drawHud(info);
+}
+
+function drawChain(p,col){
+  ctx.lineWidth=5; ctx.strokeStyle=col; ctx.lineCap="round"; ctx.beginPath(); ctx.moveTo(...p[0]); p.slice(1).forEach(q=>ctx.lineTo(...q)); ctx.stroke();
+  p.forEach(q=>{ ctx.beginPath(); ctx.arc(q[0],q[1],7,0,7); ctx.fillStyle="#fff"; ctx.fill(); ctx.lineWidth=2; ctx.strokeStyle=col; ctx.stroke(); });
+}
+function label(txt,x,y,col="#fff"){
+  ctx.font="bold 16px system-ui,sans-serif"; const w=ctx.measureText(txt).width;
+  ctx.fillStyle="rgba(0,0,0,.7)"; ctx.fillRect(x-4,y-17,w+8,23); ctx.fillStyle=col; ctx.fillText(txt,x,y);
+}
+function drawHud(i){
+  if(!i){ return; }
+  $("state").textContent=i.st; $("reps").textContent=sq.reps.length;
+  $("angles").textContent=`${i.knee.toFixed(0)}° / ${i.hip.toFixed(0)}° / ${i.tor.toFixed(0)}°`;
+  $("fb").textContent=i.msgs.length?i.msgs.join("、"):"-"; $("fb").className = i.col==="#ff5252"?"bad":"ok";
+}
+
+// ---------- results ----------
+function renderReps(){
+  $("tb").innerHTML = sq.reps.map(r=>`<tr><td>${r.rep}</td><td>${r.min_knee_deg}</td><td>${r.max_torso_lean_deg}</td><td>${r.down_time_s}/${r.up_time_s}</td>`+
+    [r.depth_ok,r.back_ok,r.valgus_ok].map(b=>`<td class="${b?"ok":"bad"}">${b?"✓":"✗"}</td>`).join("")+`</tr>`).join("");
+  $("reps").textContent = sq.reps.length;
+}
+function toCsv(rows){ if(!rows.length) return ""; const k=Object.keys(rows[0]); return "\ufeff"+[k.join(","),...rows.map(r=>k.map(c=>r[c]).join(","))].join("\n"); }
+function dl(name,text){ const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([text],{type:"text/csv"})); a.download=name; a.click(); }
+function downloadCsv(){
+  const st=new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+  if(log.length) dl(`${st}_frames.csv`, toCsv(log));
+  if(sq.reps.length) setTimeout(()=>dl(`${st}_reps.csv`, toCsv(sq.reps)),300);
+  if(!log.length) $("msg").textContent="還沒有數據可下載。";
+}
+</script>
+</body>
+</html>
