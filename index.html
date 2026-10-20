@@ -17,6 +17,7 @@
   button,select,input[type=number]{background:#2a2a2a;color:#eee;border:1px solid #444;border-radius:6px;padding:7px 11px;font-size:14px}
   button{cursor:pointer} button:hover:not(:disabled){background:#3a3a3a} button:disabled{opacity:.4;cursor:default}
   button.pri{background:#2e7d32;border-color:#2e7d32}
+  button.rec{background:#c62828;border-color:#c62828}
   .card{background:#1b1b1b;border-radius:8px;padding:12px;margin-bottom:12px}
   .card h3{margin:0 0 8px;font-size:14px;color:#aaa;font-weight:600}
   .big{font-size:28px;font-weight:700}
@@ -40,6 +41,7 @@
       <button id="btnFile" disabled>匯入影片</button>
       <input type="file" id="file" accept="video/*" hidden>
       <button id="btnPlay" disabled>暫停</button>
+      <button id="btnRec" disabled>● 錄影</button>
       <label>速度 <select id="speed"><option>0.25</option><option>0.5</option><option selected>1</option><option>2</option></select>x</label>
       <label><input type="checkbox" id="mirror"> 鏡像</label>
     </div>
@@ -74,7 +76,7 @@ import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@m
 
 const $ = id => document.getElementById(id);
 const cv = $("cv"), ctx = cv.getContext("2d"), vid = $("vid");
-const SH = {left:11,right:12}, HP = {left:23,right:24}, KN = {left:25,right:26}, AN = {left:27,right:28};
+const SH = {left:11,right:12}, HP = {left:23,right:24}, KN = {left:25,right:26}, AN = {left:27,right:28}, EA = {left:7,right:8};
 
 // ---------- geometry ----------
 const angle3 = (a,b,c) => {
@@ -127,7 +129,7 @@ class Squat {
 
 // ---------- app state ----------
 const sq = new Squat();
-const sm = {knee:new EMA(.4), hip:new EMA(.4), torso:new EMA(.4), ratio:new EMA(.4)};
+const sm = {knee:new EMA(.4), hip:new EMA(.4), torso:new EMA(.4), neck:new EMA(.4), ratio:new EMA(.4)};
 let side="right", lm=null, running=false, isCam=false, tStart=0, lastT=-1, log=[];
 const params = () => ({depth:+$("depth").value, lean:+$("lean").value, valgus:+$("valgus").value});
 
@@ -165,9 +167,35 @@ $("btnPlay").onclick = () => { if(isCam) return; if(vid.paused){vid.play();$("bt
 $("speed").onchange = () => { vid.playbackRate = +$("speed").value };
 $("btnReset").onclick = () => { sq.reset(); log=[]; renderReps(); $("reps").textContent=0; };
 $("btnCsv").onclick = downloadCsv;
-vid.onended = () => { $("msg").textContent = "影片結束，可下載 CSV。"; };
+vid.onended = () => { stopRec(); $("msg").textContent = "影片結束，可下載 CSV。"; };
+
+// ---------- recording (annotated canvas -> video file) ----------
+let rec=null, chunks=[];
+function stopRec(){ if(rec && rec.state==="recording") rec.stop(); }
+$("btnRec").onclick = () => {
+  if(rec && rec.state==="recording"){ rec.stop(); return; }
+  if(typeof MediaRecorder==="undefined"){ $("msg").innerHTML='<span class="bad">此瀏覽器不支援錄影，請改用 Chrome。</span>'; return; }
+  const types=["video/webm;codecs=vp9","video/webm;codecs=vp8","video/webm","video/mp4"];
+  const mt = types.find(t=>MediaRecorder.isTypeSupported(t)) || "";
+  chunks=[];
+  rec = new MediaRecorder(cv.captureStream(30), mt?{mimeType:mt,videoBitsPerSecond:4000000}:{});
+  rec.ondataavailable = e => { if(e.data.size) chunks.push(e.data); };
+  rec.onstop = () => {
+    const type = rec.mimeType || mt || "video/webm";
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob(chunks,{type}));
+    a.download = `squat_${new Date().toISOString().replace(/[:.]/g,"-").slice(0,19)}.${type.includes("mp4")?"mp4":"webm"}`;
+    a.click();
+    $("btnRec").textContent="● 錄影"; $("btnRec").classList.remove("rec");
+    $("msg").textContent="錄影已儲存（含骨架與角度）。";
+  };
+  rec.start();
+  $("btnRec").textContent="■ 停止並下載"; $("btnRec").classList.add("rec");
+  $("msg").textContent="錄影中…";
+};
 
 function begin(){
+  stopRec(); $("btnRec").disabled=false;
   sq.reset(); log=[]; renderReps(); Object.values(sm).forEach(x=>x.r());
   cv.width = vid.videoWidth || 960; cv.height = vid.videoHeight || 540;
   tStart = performance.now(); lastT=-1; $("btnPlay").disabled = isCam;
@@ -197,21 +225,28 @@ function loop(){
     const pick=$("side").value;
     if(pick==="auto"){ const o=side==="right"?"left":"right"; if(vis(o)>vis(side)+0.15){ side=o; Object.values(sm).forEach(x=>x.r()); } }
     else side=pick;
-    const s=pt(SH[side]), h=pt(HP[side]), k=pt(KN[side]), a=pt(AN[side]);
-    const knee=sm.knee.u(angle3(h,k,a)), hip=sm.hip.u(angle3(s,h,k)), tor=sm.torso.u(tilt(s,h));
+    const s=pt(SH[side]), h=pt(HP[side]), k=pt(KN[side]), a=pt(AN[side]), e=pt(EA[side]);
+    const knee=sm.knee.u(angle3(h,k,a)), hip=sm.hip.u(angle3(s,h,k)), tor=sm.torso.u(tilt(s,h)), neck=sm.neck.u(angle3(e,s,h));
     let ratio=null;
     if(view==="front"){ const aw=Math.abs(pt(AN.left)[0]-pt(AN.right)[0]);
       if(aw>10) ratio=sm.ratio.u(Math.abs(pt(KN.left)[0]-pt(KN.right)[0])/aw); }
     const st=sq.update(t,knee,tor,ratio,P);
-    const leanBad=tor>P.lean;
+    const leanBad=tor>P.lean, neckBad=neck<150;
     const valBad = ratio!=null && sq.base.v && ratio/sq.base.v<P.valgus && st!=="STAND";
     const col = (leanBad||valBad) ? "#ff5252" : "#4caf50";
-    const msgs=[]; if(leanBad) msgs.push("背部前傾過多"); if(valBad) msgs.push("膝蓋內夾"); if(st==="BOTTOM"&&knee<=P.depth) msgs.push("深度足夠");
+    const msgs=[]; if(leanBad) msgs.push("背部前傾過多"); if(valBad) msgs.push("膝蓋內夾"); if(neckBad) msgs.push("頭部前傾／低頭"); if(st==="BOTTOM"&&knee<=P.depth) msgs.push("深度足夠");
     drawChain([s,h,k,a], col);
+    if(view==="front"){
+      const o = side==="right" ? "left" : "right";
+      drawChain([pt(SH[o]),pt(HP[o]),pt(KN[o]),pt(AN[o])], col);
+      drawChain([s,pt(SH[o])], col); drawChain([h,pt(HP[o])], col);
+      if(ratio!=null) label(`膝/踝寬比 ${(ratio/(sq.base.v||ratio)).toFixed(2)}（1.00=站姿基準）`, 12, 30, valBad?"#ff5252":"#fff");
+    }
     label(`膝 ${knee.toFixed(0)}°`, k[0]+10, k[1]); label(`髖 ${hip.toFixed(0)}°`, h[0]+10, h[1]);
     label(`軀幹 ${tor.toFixed(0)}°`, s[0]+10, s[1], leanBad?"#ff5252":"#fff");
+    drawChain([s,e], neckBad?"#ffc83d":col); label(`頸 ${neck.toFixed(0)}°`, e[0]+10, e[1]-8, neckBad?"#ffc83d":"#fff");
     info={st,knee,hip,tor,ratio,msgs,col};
-    log.push({t_s:+t.toFixed(3), state:st, knee_deg:+knee.toFixed(1), hip_deg:+hip.toFixed(1), torso_lean_deg:+tor.toFixed(1), knee_ankle_ratio: ratio==null?"":+ratio.toFixed(3)});
+    log.push({t_s:+t.toFixed(3), state:st, knee_deg:+knee.toFixed(1), hip_deg:+hip.toFixed(1), torso_lean_deg:+tor.toFixed(1), neck_deg:+neck.toFixed(1), knee_ankle_ratio: ratio==null?"":+ratio.toFixed(3)});
   }
   drawHud(info);
 }
